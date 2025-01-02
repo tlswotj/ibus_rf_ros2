@@ -11,6 +11,7 @@ find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 
+
 # libserial 찾기
 find_path(LIBSERIAL_INCLUDE_DIR
   NAMES libserial/SerialPort.h
@@ -49,5 +50,8 @@ install(TARGETS
   DESTINATION lib/${PROJECT_NAME}
 )
 
+install(DIRECTORY launch/
+  DESTINATION share/${PROJECT_NAME}/launch
+)
 
 ament_package()
