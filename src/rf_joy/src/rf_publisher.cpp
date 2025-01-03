@@ -59,6 +59,7 @@ uint8_t CorrectDataFlusher(SerialPort &serial_port, rclcpp::Node::SharedPtr node
 vector<uint16_t> parseIbusData(SerialPort &serial_port, rclcpp::Node::SharedPtr node) {
     vector<uint8_t> data;
     do{
+        data.clear();
         data.push_back(CorrectDataFlusher(serial_port, node));
         if(serial_port.IsDataAvailable()){
             for(int i = 0; i < 31; i++){
@@ -72,7 +73,7 @@ vector<uint16_t> parseIbusData(SerialPort &serial_port, rclcpp::Node::SharedPtr 
             RCLCPP_WARN(node->get_logger(), "Received data size %zu does not match expected %zu", data.size(), IBUS_PACKET_SIZE);
         }
     }
-    while(!verifyChecksum(data) && rclcpp::ok());
+    while(!verifyChecksum(data) && rclcpp::ok() && data.size()!= IBUS_PACKET_SIZE);
 
 
     vector<uint16_t> channels;
