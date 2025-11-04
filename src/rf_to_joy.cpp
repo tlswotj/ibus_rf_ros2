@@ -28,6 +28,7 @@ private:
                 joy_msg.axes.push_back((msg.data[2]-1500)/500.0);
                 joy_msg.axes.push_back((msg.data[3]-1500)/500.0);
                 joy_msg.buttons.push_back((msg.data[5] > 1300 )? 1 : 0);
+                joy_msg.buttons.push_back((msg.data[5]>1600)? 1:0);
                 joy_publisher_->publish(joy_msg);
             }
             //else{} // autonomus driving(no joy topic publishing)
@@ -37,6 +38,7 @@ private:
             joy_msg.axes.push_back(0);
             joy_msg.axes.push_back(0);
             joy_msg.axes.push_back(0);
+            joy_msg.buttons.push_back(0);
             joy_msg.buttons.push_back(0);
             joy_publisher_->publish(joy_msg);
         }
