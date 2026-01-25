@@ -1,7 +1,6 @@
+#include <cstdint>
 #include <vector>
 #include <libserial/SerialPort.h>
-#include <libserial/SerialStream.h>
-#include <libserial/SerialStreamBuf.h>
 #include <libserial/SerialPortConstants.h>
 #include "rclcpp/rclcpp.hpp"
 #include "std_msgs/msg/u_int16_multi_array.hpp"
@@ -10,9 +9,15 @@ using namespace LibSerial;
 using namespace std;
 
 const size_t IBUS_PACKET_SIZE = 32;
+const uint8_t IBUS_HEADER = 0x20;
+const size_t IBUS_CHANNEL_COUNT = 14;
+const size_t READ_TIMEOUT_MS = 50;
 const string UART_PORT = "/dev/ttyTHS1"; // Jetson Orin NX의 UART 포트
 
 bool verifyChecksum(const std::vector<uint8_t>& data) {
+    if (data.size() < 2) {
+        return false;
+    }
     uint16_t checksum = 0xFFFF;
     for (size_t i = 0; i < data.size()-2; i++) {
         checksum -= data[i];
@@ -30,6 +35,7 @@ void portOpener(SerialPort &serial_port, rclcpp::Node::SharedPtr node){
         serial_port.SetParity(Parity::PARITY_NONE);
         serial_port.SetStopBits(StopBits::STOP_BITS_1);
         serial_port.SetFlowControl(FlowControl::FLOW_CONTROL_NONE);
+        serial_port.SetSerialPortBlockingStatus(true);
 
         if (!serial_port.IsOpen()) {
             RCLCPP_ERROR(node->get_logger(), "Cannot open port: %s", UART_PORT.c_str());
@@ -46,38 +52,63 @@ void portOpener(SerialPort &serial_port, rclcpp::Node::SharedPtr node){
 
 //flush junk data untill meet header(0x20)
 uint8_t CorrectDataFlusher(SerialPort &serial_port, rclcpp::Node::SharedPtr node){
-    uint8_t byte;
-    do{
-        if(serial_port.IsDataAvailable()){
-            serial_port.ReadByte(byte);
+    uint8_t byte = 0;
+    while (rclcpp::ok()) {
+        try {
+            serial_port.ReadByte(byte, READ_TIMEOUT_MS);
+        } catch (const ReadTimeout&) {
+            continue;
+        }
+        if (byte == IBUS_HEADER) {
+            return byte;
         }
     }
-    while(byte != 32 && rclcpp::ok());
     return byte;
 }
 
 vector<uint16_t> parseIbusData(SerialPort &serial_port, rclcpp::Node::SharedPtr node) {
     vector<uint8_t> data;
-    do{
+    data.reserve(IBUS_PACKET_SIZE);
+    while (rclcpp::ok()) {
         data.clear();
         data.push_back(CorrectDataFlusher(serial_port, node));
-        if(serial_port.IsDataAvailable()){
-            for(int i = 0; i < 31; i++){
-                uint8_t input;
-                serial_port.ReadByte(input);
-                data.push_back(input);
+        if (!rclcpp::ok()) {
+            break;
+        }
+
+        bool timed_out = false;
+        for (size_t i = 0; i < IBUS_PACKET_SIZE - 1; ++i) {
+            uint8_t input = 0;
+            try {
+                serial_port.ReadByte(input, READ_TIMEOUT_MS);
+            } catch (const ReadTimeout&) {
+                timed_out = true;
+                break;
             }
+            data.push_back(input);
+        }
+        if (timed_out) {
+            continue;
         }
 
         if (data.size() != IBUS_PACKET_SIZE) {
             RCLCPP_WARN(node->get_logger(), "Received data size %zu does not match expected %zu", data.size(), IBUS_PACKET_SIZE);
+            continue;
         }
+        if (!verifyChecksum(data)) {
+            continue;
+        }
+        break;
     }
-    while(!verifyChecksum(data) && rclcpp::ok() && data.size()!= IBUS_PACKET_SIZE);
 
+
+    if (data.size() != IBUS_PACKET_SIZE) {
+        return {};
+    }
 
     vector<uint16_t> channels;
-    for (size_t i = 0; i < 28; i += 2) { // Adjusted to parse correct range for 14 channels
+    const size_t channel_bytes_end = 2 + (IBUS_CHANNEL_COUNT * 2);
+    for (size_t i = 2; i < channel_bytes_end; i += 2) {
         uint16_t channel_value = data[i] | (data[i+1] << 8);
         channels.push_back(channel_value);
     }
@@ -95,15 +126,14 @@ int main(int argc, char * argv[]) {
         portOpener(serial_port, node);
         while (rclcpp::ok()) {
             vector<uint16_t> data = parseIbusData(serial_port, node);
-            if (data.size() < 14) {
+            if (data.size() < IBUS_CHANNEL_COUNT) {
                 RCLCPP_WARN(node->get_logger(), "Insufficient channel data received.");
                 continue;
             }
 
-            vector<uint16_t> channels(data.begin() + 1, data.begin() + 15); // Adjusted indices for 14 channels
             std_msgs::msg::UInt16MultiArray message;
 
-            message.data = channels;
+            message.data = data;
             publisher->publish(message);
 
             rclcpp::spin_some(node);
