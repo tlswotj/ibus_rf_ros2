@@ -21,6 +21,11 @@ private:
     {
         auto joy_msg = sensor_msgs::msg::Joy();
 
+        if (msg.data.size() < 6) {
+            RCLCPP_WARN(this->get_logger(), "RF data size %zu is smaller than expected", msg.data.size());
+            return;
+        }
+
         if(msg.data[4]>1600){                //kill switch
             if(msg.data[5]<1600){ // user input mode
                 joy_msg.axes.push_back((msg.data[0]-1500)/500.0);
