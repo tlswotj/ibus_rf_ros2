@@ -1,12 +1,15 @@
 #include <cstdint>
 #include <vector>
+#include <deque>
+#include <thread>
+#include <chrono>
 #include <libserial/SerialPort.h>
 #include <libserial/SerialPortConstants.h>
 #include "rclcpp/rclcpp.hpp"
 #include "std_msgs/msg/u_int16_multi_array.hpp"
 
 using namespace LibSerial;
-using namespace std;
+using namespace std::chrono_literals;
 
 const size_t IBUS_PACKET_SIZE = 32;
 const uint8_t IBUS_HEADER = 0x20;
@@ -19,17 +22,16 @@ bool verifyChecksum(const std::vector<uint8_t>& data) {
         return false;
     }
     uint16_t checksum = 0xFFFF;
-    for (size_t i = 0; i < data.size()-2; i++) {
-        checksum -= data[i];
-    }
-    uint16_t received_checksum = data[data.size()-2] | (data[data.size()-1] << 8);
-    return checksum == received_checksum;
+    for (size_t i = 0; i < sz - 2; ++i) checksum -= data[i];
+    const uint16_t recv = static_cast<uint16_t>(data[sz - 2])
+                        | static_cast<uint16_t>(data[sz - 1] << 8);
+    return checksum == recv;
 }
 
-void portOpener(SerialPort &serial_port, rclcpp::Node::SharedPtr node){
+// ===== Serial open =====
+static void portOpener(SerialPort &serial_port, const rclcpp::Logger& log) {
     try {
         serial_port.Open(UART_PORT);
-
         serial_port.SetBaudRate(BaudRate::BAUD_115200);
         serial_port.SetCharacterSize(CharacterSize::CHAR_SIZE_8);
         serial_port.SetParity(Parity::PARITY_NONE);
@@ -38,11 +40,10 @@ void portOpener(SerialPort &serial_port, rclcpp::Node::SharedPtr node){
         serial_port.SetSerialPortBlockingStatus(true);
 
         if (!serial_port.IsOpen()) {
-            RCLCPP_ERROR(node->get_logger(), "Cannot open port: %s", UART_PORT.c_str());
-            return;
+            RCLCPP_ERROR(log, "Cannot open port: %s", UART_PORT.c_str());
+            throw LibSerial::OpenFailed("Port open failed after configuration.");
         }
-
-        RCLCPP_INFO(node->get_logger(), "Waiting for IBUS data...");
+        RCLCPP_INFO(log, "IBUS receiver on %s (115200-8N1).", UART_PORT.c_str());
     }
     catch (const OpenFailed& e) {
         RCLCPP_ERROR(node->get_logger(), "Failed to open port %s: %s", UART_PORT.c_str(), e.what());
@@ -112,24 +113,38 @@ vector<uint16_t> parseIbusData(SerialPort &serial_port, rclcpp::Node::SharedPtr 
         uint16_t channel_value = data[i] | (data[i+1] << 8);
         channels.push_back(channel_value);
     }
-    return channels;
+    return false;
 }
 
-int main(int argc, char * argv[]) {
+int main(int argc, char* argv[]) {
     rclcpp::init(argc, argv);
     auto node = rclcpp::Node::make_shared("rf_publisher");
-    auto publisher = node->create_publisher<std_msgs::msg::UInt16MultiArray>("/rf", 10);
+    auto log  = node->get_logger();
+    auto pub  = node->create_publisher<std_msgs::msg::UInt16MultiArray>("/rf", 10);
 
     SerialPort serial_port;
+    rclcpp::Rate rate(30.0); // 메인 루프 30Hz
+
+    // 최신값 유지 (신호가 끊겨도 30Hz로 발행 지속)
+    std::vector<uint16_t> last_channels(14, 1500);
+
+    // 수신 바이트 축적 버퍼 (현재 주기에서 시리얼 버퍼를 비워 이쪽으로 모음)
+    std::vector<uint8_t> rxbuf;
+    rxbuf.reserve(IBUS_PACKET_SIZE * 8);
+
+    auto last_rx_time = std::chrono::steady_clock::now();
+    const auto idle_reset = 500ms;   // 이 시간 이상 무신호면 재동기화를 위해 입력 버퍼 정리
 
     try {
-        portOpener(serial_port, node);
+        portOpener(serial_port, log);
+
         while (rclcpp::ok()) {
             vector<uint16_t> data = parseIbusData(serial_port, node);
             if (data.size() < IBUS_CHANNEL_COUNT) {
                 RCLCPP_WARN(node->get_logger(), "Insufficient channel data received.");
                 continue;
             }
+            if (any_read) last_rx_time = std::chrono::steady_clock::now();
 
             std_msgs::msg::UInt16MultiArray message;
 
@@ -137,22 +152,26 @@ int main(int argc, char * argv[]) {
             publisher->publish(message);
 
             rclcpp::spin_some(node);
+            rate.sleep(); // 30Hz 루프 → CPU 안정
         }
 
-
-        serial_port.Close();
-        RCLCPP_INFO(node->get_logger(), "%s is closed.", UART_PORT.c_str());
-
-    } catch (const OpenFailed& e) {
-        serial_port.Close();
-        RCLCPP_ERROR(node->get_logger(), "Cannot open the port: %s, Exception: %s", UART_PORT.c_str(), e.what());
-        return 1;
-    } catch (const exception& e) {
-        serial_port.Close();
+        if (serial_port.IsOpen()) serial_port.Close();
+        RCLCPP_INFO(log, "%s closed.", UART_PORT.c_str());
+    }
+    catch (const OpenFailed& e) {
+        if (serial_port.IsOpen()) serial_port.Close();
+        RCLCPP_ERROR(log, "Cannot open %s: %s", UART_PORT.c_str(), e.what());
         rclcpp::shutdown();
-        RCLCPP_ERROR(node->get_logger(), "Exception caused: %s", e.what());
+        return 1;
+    }
+    catch (const std::exception& e) {
+        if (serial_port.IsOpen()) serial_port.Close();
+        RCLCPP_ERROR(log, "Exception: %s", e.what());
+        rclcpp::shutdown();
+        return 1;
     }
 
     rclcpp::shutdown();
     return 0;
 }
+
