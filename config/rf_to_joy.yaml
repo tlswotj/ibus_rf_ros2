@@ -1,0 +1,26 @@
+rf_to_joy_node:
+  ros__parameters:
+    kill_switch:
+      channel: 4
+      threshold: 1600
+      active_when_above: true
+
+    # When enabled, /joy is only published while this condition is true.
+    publish_gate:
+      enabled: true
+      channel: 5
+      threshold: 1600
+      active_when_above: false
+
+    # The array order becomes the output Joy axis index.
+    axes:
+      channels: [0, 1, 2, 3]
+      offsets: [1500.0, 1500.0, 1500.0, 1500.0]
+      scales: [500.0, 500.0, 500.0, 500.0]
+      invert: [false, false, false, false]
+
+    # The array order becomes the output Joy button index.
+    buttons:
+      channels: [5, 5]
+      thresholds: [1300, 1600]
+      active_when_above: [true, true]

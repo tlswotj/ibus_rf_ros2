@@ -38,20 +38,19 @@ ament_target_dependencies(rf_publisher_node rclcpp std_msgs)
 ament_target_dependencies(rf_to_joy_node rclcpp std_msgs sensor_msgs)
 
 target_link_libraries(rf_publisher_node ${LIBSERIAL_LIB})
-target_link_libraries(rf_to_joy_node ${LIBSERIAL_LIB})
 
 install(TARGETS
   rf_publisher_node
-  DESTINATION lib/${PROJECT_NAME}
-)
-
-install(TARGETS
   rf_to_joy_node
   DESTINATION lib/${PROJECT_NAME}
 )
 
 install(DIRECTORY launch/
   DESTINATION share/${PROJECT_NAME}/launch
+)
+
+install(DIRECTORY config/
+  DESTINATION share/${PROJECT_NAME}/config
 )
 
 ament_package()
