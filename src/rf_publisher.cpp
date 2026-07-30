@@ -12,11 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <algorithm>
+#include <poll.h>
+#include <unistd.h>
+
+#include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -251,38 +256,51 @@ private:
     }
   }
 
-  // Returns false when the read timed out without producing any data.
+  // Returns false when the wait timed out without producing any data.
+  //
+  // This reads the descriptor directly instead of going through LibSerial's Read(), because
+  // Read(buffer, n, msTimeout) cannot be used safely on a blocking port: it waits inside
+  // read() for all n bytes and only checks its own timeout between iterations, so it never
+  // times out. Sizing n from GetNumberOfBytesAvailable() therefore stalls indefinitely
+  // whenever fewer bytes are delivered than the queue advertised, which is what dragged the
+  // publish rate down on real UART hardware. poll() plus one read() of whatever is queued
+  // has neither problem: it parks the thread while the receiver is quiet, hands over the
+  // whole backlog in a single call, and never waits on a byte count that may not arrive.
   bool read_available_bytes()
   {
-    std::uint8_t first_byte = 0;
-    try {
-      // Waiting on a single byte is what keeps this thread idle while the receiver is
-      // quiet. read_timeout_ms bounds the wait so shutdown stays responsive.
-      serial_port_.ReadByte(first_byte, static_cast<std::size_t>(read_timeout_ms_));
-    } catch (const LibSerial::ReadTimeout &) {
+    const int fd = serial_port_.GetFileDescriptor();
+
+    struct pollfd poll_descriptor {};
+    poll_descriptor.fd = fd;
+    poll_descriptor.events = POLLIN;
+
+    const int ready = ::poll(&poll_descriptor, 1, read_timeout_ms_);
+    if (ready == 0) {
+      return false;
+    }
+    if (ready < 0) {
+      if (errno == EINTR) {
+        return false;
+      }
+      throw std::runtime_error(std::string("poll failed: ") + std::strerror(errno));
+    }
+
+    std::array<std::uint8_t, kMaxReadChunkBytes> chunk{};
+    const auto received = ::read(fd, chunk.data(), chunk.size());
+    if (received < 0) {
+      if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+        return false;
+      }
+      throw std::runtime_error(std::string("read failed: ") + std::strerror(errno));
+    }
+    if (received == 0) {
       return false;
     }
 
-    rx_buffer_.push_back(first_byte);
-
-    // Take everything the kernel already holds in one call. This is what drains a
-    // backlog instead of metering it out one frame per cycle.
-    std::size_t available = 0;
-    const auto bytes_available = serial_port_.GetNumberOfBytesAvailable();
-    if (bytes_available > 0) {
-      available = std::min(static_cast<std::size_t>(bytes_available), kMaxReadChunkBytes);
-    }
-
-    if (available > 0) {
-      LibSerial::DataBuffer chunk;
-      try {
-        serial_port_.Read(chunk, available, static_cast<std::size_t>(read_timeout_ms_));
-      } catch (const LibSerial::ReadTimeout &) {
-        // These bytes were reported as available, so a timeout here is not expected.
-        // Keep whatever landed in the buffer; the parser only acts on whole frames.
-      }
-      rx_buffer_.insert(rx_buffer_.end(), chunk.begin(), chunk.end());
-    }
+    rx_buffer_.insert(
+      rx_buffer_.end(),
+      chunk.begin(),
+      chunk.begin() + static_cast<std::ptrdiff_t>(received));
 
     return true;
   }
