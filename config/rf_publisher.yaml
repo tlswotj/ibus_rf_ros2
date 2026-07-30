@@ -2,5 +2,31 @@ rf_publisher_node:
   ros__parameters:
     serial_port: "/dev/ttyTHS1"
     baud_rate: 115200
+
+    # 시리얼에서 첫 바이트를 기다리는 최대 시간(ms).
+    # 수신이 없을 때 읽기 스레드가 대기하는 단위이고, 종료 응답 시간의 상한도 된다.
     read_timeout_ms: 50
-    publish_rate_hz: 30.0
+
+    # true면 한 번에 읽어들인 데이터에서 가장 최신 프레임만 발행한다(제어 입력에 권장).
+    # false면 읽어들인 유효 프레임을 모두 발행한다.
+    publish_latest_only: true
+
+    # /rf 발행 상한(Hz). 포트는 항상 i-BUS 속도(약 140Hz)로 다 비우고, 이 값은
+    # "가장 최신 프레임을 얼마나 자주 DDS로 넘길지"만 제한한다. 따라서 값을 낮춰도
+    # 지연이 누적되지 않는다. 140Hz로 그대로 발행하면 publish/take/콜백 비용이
+    # 약 5배가 되므로 기본값은 기존 토픽 부하와 같은 30Hz로 둔다.
+    # 0.0으로 두면 제한 없이 프레임마다 발행한다(CPU 여유가 있을 때만 권장).
+    # 실측 발행률은 설정값보다 5~10% 낮게 나온다(간격 기준이 마지막 발행 시각이라 상한을 넘지 않음).
+    max_publish_rate_hz: 30.0
+
+    # 이 시간 동안 유효한 i-BUS 프레임이 없으면 경고를 남긴다.
+    signal_timeout_ms: 500
+
+    # 포트를 열지 못했거나 읽는 중 끊어졌을 때 재시도 간격(ms).
+    reconnect_interval_ms: 1000
+
+    # rf_to_joy_node의 qos.rf_subscription과 반드시 같아야 한다.
+    # best_effort로 바꾸면 `ros2 topic echo /rf`도 --qos-reliability best_effort가 필요하다.
+    qos:
+      reliability: "reliable"   # "reliable" | "best_effort"
+      depth: 10

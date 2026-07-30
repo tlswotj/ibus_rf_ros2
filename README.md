@@ -25,6 +25,10 @@ FlySky `FS-i6X` 송신기와 `FS-A8S` 수신기의 `i-BUS` 출력을 리눅스 �
 공식 매뉴얼 요약 기준으로 `i-BUS`는 최대 18채널, `S.BUS`는 최대 16채널 출력이 가능하며, `RSSI`가 `CH14` 값으로 전달될 수 있다.  
 이 패키지는 현재 `i-BUS` 프레임에서 **14개 채널**을 읽어 `/rf`로 발행한다.
 
+`i-BUS` 채널 값은 하위 `12bit`에 담긴다.
+송신기를 18채널 모드로 두면 `CH15 ~ CH18` 값이 뒤쪽 채널의 상위 니블에 실려 오기 때문에,
+이 패키지는 채널 값을 `0x0FFF`로 마스킹한 뒤 발행한다.
+
 통신 흐름은 아래와 같다.
 
 ```text
@@ -162,6 +166,13 @@ colcon build --packages-select rf_joy
 source install/setup.bash
 ```
 
+lint 검사는 아래로 실행한다.
+
+```bash
+colcon test --packages-select rf_joy
+colcon test-result --verbose
+```
+
 ### 4.4 시리얼 권한
 
 USB-TTL 어댑터가 `/dev/ttyUSB0` 등으로 잡혔는데 권한 에러가 나면 아래를 확인한다.
@@ -196,7 +207,13 @@ rf_publisher_node:
     serial_port: "/dev/ttyTHS1"
     baud_rate: 115200
     read_timeout_ms: 50
-    publish_rate_hz: 30.0
+    publish_latest_only: true
+    max_publish_rate_hz: 30.0
+    signal_timeout_ms: 500
+    reconnect_interval_ms: 1000
+    qos:
+      reliability: "reliable"
+      depth: 10
 ```
 
 파라미터 설명:
@@ -208,10 +225,54 @@ rf_publisher_node:
   `i-BUS` 수신 baud rate
   기본값은 `115200`
 - `read_timeout_ms`
-  시리얼에서 바이트를 읽을 때 최대 대기 시간(ms)
-  너무 작으면 패킷을 자주 놓칠 수 있고, 너무 크면 수신이 없을 때 반응성이 떨어질 수 있다
-- `publish_rate_hz`
-  `/rf` 발행 주기
+  시리얼에서 첫 바이트를 기다리는 최대 시간(ms)
+  수신이 없을 때 읽기 스레드가 대기하는 단위이고, 노드 종료 응답 시간의 상한도 된다
+- `publish_latest_only`
+  `true`면 한 번에 읽어들인 데이터에서 가장 최신 프레임만 발행한다 (제어 입력에는 이 값을 권장)
+  `false`면 읽어들인 유효 프레임을 모두 발행한다
+- `max_publish_rate_hz`
+  `/rf` 발행 상한(Hz)
+  포트는 항상 `i-BUS` 속도(약 `140Hz`)로 다 비우고, 이 값은 "가장 최신 프레임을 얼마나 자주 DDS로 넘길지"만 제한한다
+  따라서 낮춰도 지연이 누적되지 않는다
+  `0.0`이면 제한 없이 프레임마다 발행한다
+  실측 발행률은 설정값보다 `5 ~ 10%` 낮게 나온다 (간격 기준이 마지막 발행 시각이라 상한을 절대 넘지 않는다)
+- `signal_timeout_ms`
+  이 시간 동안 유효한 `i-BUS` 프레임이 없으면 경고 로그를 남긴다
+- `reconnect_interval_ms`
+  포트를 열지 못했거나 읽는 중 끊어졌을 때 재시도 간격(ms)
+- `qos.reliability` / `qos.depth`
+  `/rf` 토픽의 QoS
+  `rf_to_joy_node`의 `qos.rf_subscription`과 **반드시 같아야** 한다
+
+> `publish_rate_hz`는 `max_publish_rate_hz`로 대체됐다.
+> 이전 구현은 타이머 한 tick마다 프레임을 딱 1개만 읽었는데, `i-BUS` 프레임은 약 `7ms`마다 오기 때문에
+> 남는 프레임이 커널 버퍼에 계속 쌓이다가 버퍼가 포화되면 **약 1초 지연이 고정으로 남았다**.
+> 지금은 읽기와 발행이 분리되어 있어서, 포트는 항상 다 비우면서 발행률만 따로 정할 수 있다.
+
+### 5.2 읽기 방식과 CPU 사용량
+
+`i-BUS` 프레임 속도를 그대로 발행하면 `/rf`, `/joy` 양쪽의 `publish` / `take` / 콜백 비용이 약 5배가 된다.
+그래서 이 패키지는 **읽기는 최대 속도로, 발행은 제한**하는 구조를 쓴다.
+
+pty에 `140Hz`로 합성 `i-BUS` 프레임을 흘려 실제 `libserial 1.0.0`으로 측정한 결과다.
+(x86 컨테이너 기준이므로 절대값이 아니라 비율만 참고할 것)
+
+| 방식 | 프레임 파싱 | 유실 | `/rf` 발행 | `read()` syscall / 프레임 |
+|---|---|---|---|---|
+| 이전 (30Hz 타이머, 1바이트씩) | `29.8/s` | **`451/1391`** | `29.8/s` | `32` |
+| 현재 (`max_publish_rate_hz: 0.0`) | `139.1/s` | `0` | `139.1/s` | `2` |
+| **현재 기본값 (`30.0`)** | `139.1/s` | `0` | `28.0/s` | `2` |
+
+핵심은 두 가지다.
+
+- 읽기 비용이 **줄었다**. 블로킹 대기 1회 + 벌크 `read()` 1회로 배치를 다 가져오므로,
+  프레임당 `read()` syscall이 `32`에서 `2`로 떨어진다.
+  이전 방식은 프레임 대부분을 버리면서도 syscall을 더 많이 썼다.
+- 발행 부하는 기본값에서 이전과 같다. `28/s`는 이전 `29.8/s`와 사실상 동일하다.
+
+CPU 여유가 있고 지연을 더 줄이고 싶으면 `max_publish_rate_hz`를 올리거나 `0.0`으로 두면 된다.
+반대로 더 줄여야 하면 값을 낮추되, `rf_to_joy_node`의 `watchdog.timeout_ms`가
+`/rf` 발행 주기의 몇 배는 되도록 함께 확인한다.
 
 시리얼 장치 이름을 찾는 데는 아래 명령이 유용하다.
 
@@ -225,7 +286,7 @@ USB-TTL을 연결한 직후 어떤 장치가 생겼는지 보려면 아래를 �
 dmesg | tail -n 50
 ```
 
-### 5.2 `rf_to_joy.yaml`
+### 5.3 `rf_to_joy.yaml`
 
 파일: [`config/rf_to_joy.yaml`](./config/rf_to_joy.yaml)
 
@@ -253,6 +314,20 @@ rf_to_joy_node:
       channels: [5, 5]
       thresholds: [1300, 1600]
       active_when_above: [true, true]
+
+    watchdog:
+      enabled: true
+      timeout_ms: 200
+      rate_hz: 50.0
+      # failsafe_axes: [0.0, 0.0, -1.0, 0.0]
+
+    qos:
+      rf_subscription:
+        reliability: "reliable"
+        depth: 10
+      joy_publisher:
+        reliability: "reliable"
+        depth: 10
 ```
 
 중요:
@@ -263,9 +338,10 @@ rf_to_joy_node:
 파라미터 설명:
 
 - `kill_switch`
-  이 조건이 거짓이면 `/joy`는 0으로 채워 발행된다.
+  이 조건이 거짓이면 `/joy`는 failsafe 값으로 채워 발행된다.
 - `publish_gate`
   이 조건이 거짓이면 `/joy` 자체를 발행하지 않는다.
+  단 `kill_switch`와 `watchdog`은 이 게이트와 무관하게 항상 failsafe를 발행한다.
 - `axes.channels`
   배열 순서가 `Joy.axes[]` 인덱스가 된다.
 - `axes.offsets`
@@ -282,6 +358,38 @@ rf_to_joy_node:
 - `buttons.active_when_above`
   `true`면 `value > threshold`일 때 1
   `false`면 `value < threshold`일 때 1
+- `watchdog.enabled`
+  `/rf` 감시 기능 사용 여부
+  끄면 신호가 끊겼을 때 `/joy` 발행이 그냥 멈추므로, 다운스트림이 마지막 명령을 계속 붙들 수 있다
+- `watchdog.timeout_ms`
+  이 시간 동안 사용 가능한 `/rf` 메시지가 없으면 failsafe 상태로 들어간다
+- `watchdog.rate_hz`
+  failsafe 상태에서 `/joy`를 다시 발행하는 주기
+- `watchdog.failsafe_axes`
+  failsafe 상태와 킬 스위치 동작 시 내보낼 축 값
+  지정하지 않으면 모든 축을 `0.0`으로 채운다
+  스로틀처럼 중앙(`0.0`)이 안전값이 아닌 축이 있으면 `axes.channels`와 같은 길이로 `-1.0 ~ 1.0` 범위에서 직접 지정한다
+- `qos.rf_subscription`
+  `/rf` 구독 QoS
+  `rf_publisher_node`의 `qos`와 **반드시 같아야** 한다. 다르면 데이터가 아예 흐르지 않는다
+- `qos.joy_publisher`
+  `/joy` 발행 QoS
+  `teleop_twist_joy` 같은 일반적인 구독자는 `reliable`을 쓰므로 기본값을 그대로 두는 것을 권장한다
+
+`watchdog.failsafe_axes`는 빈 배열 `[]`로 적지 않는다.
+ROS 2 파라미터 YAML은 빈 시퀀스의 타입을 추론할 수 없어서, 필요 없으면 항목 자체를 주석 처리해 두면 된다.
+
+### 5.4 안전 동작 정리
+
+`/joy` 출력은 아래 우선순위로 결정된다.
+
+1. `/rf`가 `watchdog.timeout_ms` 이상 없으면 → failsafe 발행 (게이트 무시)
+2. 킬 스위치 조건이 거짓이면 → failsafe 발행 (게이트 무시)
+3. `publish_gate` 조건이 거짓이면 → 발행하지 않음
+4. 그 외 → 정상 매핑 발행
+
+`rf_publisher_node`도 실행 중 시리얼 장치가 사라지면 프로세스를 종료하지 않고
+`reconnect_interval_ms` 간격으로 포트를 다시 열려고 시도한다.
 
 ## 6. 실행 방법
 
@@ -349,6 +457,31 @@ ros2 topic hz /joy
 - `kill_switch` 조건이 현재 입력 상태와 맞는지 확인한다.
 - `publish_gate.enabled`와 `publish_gate` threshold가 현재 스위치 방향과 맞는지 확인한다.
 - 채널 번호를 `0-based`로 썼는지 확인한다.
+- `qos.rf_subscription`이 `rf_publisher_node`의 `qos`와 같은지 확인한다.
+  한쪽만 `best_effort`면 QoS가 호환되지 않아 데이터가 아예 흐르지 않는다.
+
+### `/joy`가 계속 failsafe 값만 나오는 경우
+
+`No /rf message for ... ms, publishing failsafe Joy` 경고가 보이면 watchdog이 동작 중인 것이다.
+
+- `/rf`가 실제로 발행되고 있는지 `ros2 topic hz /rf`로 확인한다.
+- `RF data size ... is smaller than required` 경고가 함께 보이면 채널 매핑이 프레임 폭을 넘긴 것이다.
+  `axes.channels` / `buttons.channels` 값을 확인한다.
+- `/rf` 발행 주기가 `watchdog.timeout_ms`보다 느리면 오탐이 난다.
+  `max_publish_rate_hz`를 낮게 설정했다면 `timeout_ms`도 함께 늘려야 한다.
+
+### `CH7 ~ CH14` 값이 비정상적으로 큰 경우
+
+송신기가 18채널 `i-BUS` 모드일 때 나타난다.
+현재 코드는 `0x0FFF` 마스킹을 하므로 정상 범위로 나와야 하며, 그래도 이상하면 송신기 출력 모드를 확인한다.
+
+### `No valid IBUS frame ... for ... ms` 경고가 계속 나오는 경우
+
+바이트는 들어오지만 유효한 프레임으로 조립되지 않는 상태다.
+
+- `baud_rate`가 `115200`인지 확인한다.
+- 수신기 출력 모드가 `S.BUS`가 아니라 `i-BUS`인지 확인한다.
+- 신호선을 `RX`에 연결했는지, `GND`가 공통인지 확인한다.
 
 ### 축/버튼이 기대와 다르게 매핑되는 경우
 
@@ -375,3 +508,7 @@ ros2 topic hz /joy
 - FlySky failsafe 안내: https://www.flysky-cn.com/journal/2021/2/21/about-the-flysky-remote-control-failsafe-function
 - FS-A8S Quick Start Manual 요약: https://www.manualslib.com/manual/2768791/Flysky-Fs-A8s.html
 - FS-i6 / FS-i6X 바인딩 절차 요약: https://www.manualslib.com/manual/3611714/Flysky-Fs-I6.html
+
+## 10. 라이선스
+
+`Apache License 2.0`. 전문은 [`LICENSE`](./LICENSE)를 참고한다.

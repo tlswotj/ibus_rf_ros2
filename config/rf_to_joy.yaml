@@ -24,3 +24,27 @@ rf_to_joy_node:
       channels: [5, 5]
       thresholds: [1300, 1600]
       active_when_above: [true, true]
+
+    # /rf가 끊기면 다운스트림이 마지막 명령을 계속 붙들고 있게 되므로,
+    # timeout_ms 동안 /rf가 없으면 failsafe Joy를 rate_hz로 계속 발행한다.
+    watchdog:
+      enabled: true
+      timeout_ms: 200
+      rate_hz: 50.0
+
+      # 축 failsafe 값. 지정하지 않으면 모든 축을 0.0으로 채운다.
+      # 스로틀처럼 중앙(0.0)이 안전값이 아닌 축이 있으면 axes.channels와 같은 길이로,
+      # -1.0 ~ 1.0 범위에서 직접 지정한다. (빈 배열 []은 ROS 2 YAML에서 타입 추론이
+      # 안 되므로 쓰지 말고, 필요 없으면 아래 줄을 그대로 주석 처리해 둔다.)
+      # failsafe_axes: [0.0, 0.0, -1.0, 0.0]
+
+    qos:
+      # rf_subscription은 rf_publisher_node의 qos와 반드시 같아야 한다.
+      rf_subscription:
+        reliability: "reliable"   # "reliable" | "best_effort"
+        depth: 10
+
+      # /joy 구독자(teleop_twist_joy 등)는 보통 reliable이므로 기본값을 유지한다.
+      joy_publisher:
+        reliability: "reliable"   # "reliable" | "best_effort"
+        depth: 10

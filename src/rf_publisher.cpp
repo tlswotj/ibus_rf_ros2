@@ -1,9 +1,26 @@
+// Copyright 2026 gongbang
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
-#include <functional>
+#include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <libserial/SerialPort.h>
@@ -12,31 +29,26 @@
 #include "rclcpp/rclcpp.hpp"
 #include "std_msgs/msg/u_int16_multi_array.hpp"
 
+#include "rf_joy/ibus_protocol.hpp"
+
 namespace
 {
-constexpr std::size_t kIbusPacketSize = 32;
-constexpr std::size_t kIbusChannelCount = 14;
-constexpr std::uint8_t kIbusHeader = 0x20;
-constexpr int kDefaultReadTimeoutMs = 50;
+// Upper bound for a single bulk read so a full kernel buffer cannot force one large
+// allocation. Any remainder is picked up on the next iteration without waiting.
+constexpr std::size_t kMaxReadChunkBytes = 1024;
+
 constexpr int kDefaultBaudRate = 115200;
-constexpr double kDefaultPublishRateHz = 30.0;
+constexpr int kDefaultReadTimeoutMs = 50;
 
-bool verify_checksum(const std::vector<std::uint8_t> &data)
-{
-  if (data.size() != kIbusPacketSize) {
-    return false;
-  }
-
-  std::uint16_t checksum = 0xFFFF;
-  for (std::size_t i = 0; i < kIbusPacketSize - 2; ++i) {
-    checksum -= data[i];
-  }
-
-  const auto received_checksum = static_cast<std::uint16_t>(data[kIbusPacketSize - 2]) |
-    (static_cast<std::uint16_t>(data[kIbusPacketSize - 1]) << 8);
-
-  return checksum == received_checksum;
-}
+// The port is drained at the full i-BUS rate regardless, so this only bounds how often the
+// freshest frame is handed to DDS. Publishing every frame at about 140 Hz multiplies the
+// publish, take and callback work by roughly five for no gain in control quality, so the
+// default keeps the previous 30 Hz topic load.
+constexpr double kDefaultMaxPublishRateHz = 30.0;
+constexpr int kDefaultSignalTimeoutMs = 500;
+constexpr int kDefaultReconnectIntervalMs = 1000;
+constexpr int kDefaultQosDepth = 10;
+constexpr int kShutdownPollIntervalMs = 20;
 
 LibSerial::BaudRate to_baud_rate(const int baud_rate)
 {
@@ -63,8 +75,34 @@ LibSerial::BaudRate to_baud_rate(const int baud_rate)
       throw std::invalid_argument("Unsupported baud rate: " + std::to_string(baud_rate));
   }
 }
+
+rclcpp::QoS make_qos(const std::string & reliability, const int depth)
+{
+  if (depth <= 0) {
+    throw std::invalid_argument("QoS depth must be greater than 0");
+  }
+
+  rclcpp::QoS qos(rclcpp::KeepLast(static_cast<std::size_t>(depth)));
+  if (reliability == "reliable") {
+    qos.reliable();
+  } else if (reliability == "best_effort") {
+    qos.best_effort();
+  } else {
+    throw std::invalid_argument(
+      "QoS reliability must be \"reliable\" or \"best_effort\", got: " + reliability);
+  }
+
+  return qos;
+}
 }  // namespace
 
+// Reads i-BUS frames from a serial port and republishes the channel values on /rf.
+//
+// The port is served by a dedicated thread rather than a timer callback. A timer that
+// consumes one frame per tick falls behind whenever the tick period is longer than the
+// i-BUS frame period (about 7 ms), and the backlog ends up as a fixed latency once the
+// kernel buffer saturates. The reader thread instead takes every byte the port has and
+// keeps only the newest complete frame, so latency stays bounded by the frame rate.
 class RfPublisherNode : public rclcpp::Node
 {
 public:
@@ -72,147 +110,303 @@ public:
   : Node("rf_publisher_node")
   {
     serial_port_name_ = this->declare_parameter<std::string>("serial_port", "/dev/ttyTHS1");
+    baud_rate_ = this->declare_parameter<int>("baud_rate", kDefaultBaudRate);
     read_timeout_ms_ = this->declare_parameter<int>("read_timeout_ms", kDefaultReadTimeoutMs);
-    const auto baud_rate = this->declare_parameter<int>("baud_rate", kDefaultBaudRate);
-    const auto publish_rate_hz =
-      this->declare_parameter<double>("publish_rate_hz", kDefaultPublishRateHz);
+    publish_latest_only_ = this->declare_parameter<bool>("publish_latest_only", true);
+    signal_timeout_ms_ =
+      this->declare_parameter<int>("signal_timeout_ms", kDefaultSignalTimeoutMs);
+    reconnect_interval_ms_ =
+      this->declare_parameter<int>("reconnect_interval_ms", kDefaultReconnectIntervalMs);
+    const auto max_publish_rate_hz =
+      this->declare_parameter<double>("max_publish_rate_hz", kDefaultMaxPublishRateHz);
+    const auto qos_reliability =
+      this->declare_parameter<std::string>("qos.reliability", "reliable");
+    const auto qos_depth = this->declare_parameter<int>("qos.depth", kDefaultQosDepth);
 
     if (read_timeout_ms_ <= 0) {
       throw std::invalid_argument("read_timeout_ms must be greater than 0");
     }
-    if (publish_rate_hz <= 0.0) {
-      throw std::invalid_argument("publish_rate_hz must be greater than 0");
+    if (signal_timeout_ms_ <= 0) {
+      throw std::invalid_argument("signal_timeout_ms must be greater than 0");
+    }
+    if (reconnect_interval_ms_ <= 0) {
+      throw std::invalid_argument("reconnect_interval_ms must be greater than 0");
+    }
+    if (max_publish_rate_hz < 0.0) {
+      throw std::invalid_argument("max_publish_rate_hz must be zero or greater");
     }
 
-    publisher_ = this->create_publisher<std_msgs::msg::UInt16MultiArray>("/rf", 10);
+    // Reject an unsupported baud rate here instead of inside the reader thread, where it
+    // would be reported once per reconnect attempt forever.
+    to_baud_rate(baud_rate_);
 
-    open_serial_port(baud_rate);
+    if (max_publish_rate_hz > 0.0) {
+      max_publish_period_ = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<double>(1.0 / max_publish_rate_hz));
+    }
 
-    const auto timer_period =
-      std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::duration<double>(1.0 / publish_rate_hz));
-    timer_ = this->create_wall_timer(
-      timer_period,
-      std::bind(&RfPublisherNode::publish_frame, this));
+    publisher_ = this->create_publisher<std_msgs::msg::UInt16MultiArray>(
+      "/rf", make_qos(qos_reliability, qos_depth));
+
+    rx_buffer_.reserve(kMaxReadChunkBytes + rf_joy::ibus::kPacketSize);
+
+    const auto start_time = std::chrono::steady_clock::now();
+    last_frame_time_ = start_time;
+    last_publish_time_ = start_time - max_publish_period_;
+
+    running_ = true;
+    reader_thread_ = std::thread(&RfPublisherNode::read_loop, this);
   }
 
   ~RfPublisherNode() override
   {
-    if (serial_port_.IsOpen()) {
-      serial_port_.Close();
+    running_ = false;
+    if (reader_thread_.joinable()) {
+      reader_thread_.join();
     }
+    close_serial_port();
   }
 
 private:
-  void open_serial_port(const int baud_rate)
+  bool try_open_serial_port()
   {
-    serial_port_.Open(serial_port_name_);
-    serial_port_.SetBaudRate(to_baud_rate(baud_rate));
-    serial_port_.SetCharacterSize(LibSerial::CharacterSize::CHAR_SIZE_8);
-    serial_port_.SetParity(LibSerial::Parity::PARITY_NONE);
-    serial_port_.SetStopBits(LibSerial::StopBits::STOP_BITS_1);
-    serial_port_.SetFlowControl(LibSerial::FlowControl::FLOW_CONTROL_NONE);
-    serial_port_.SetSerialPortBlockingStatus(true);
+    try {
+      serial_port_.Open(serial_port_name_);
+      serial_port_.SetBaudRate(to_baud_rate(baud_rate_));
+      serial_port_.SetCharacterSize(LibSerial::CharacterSize::CHAR_SIZE_8);
+      serial_port_.SetParity(LibSerial::Parity::PARITY_NONE);
+      serial_port_.SetStopBits(LibSerial::StopBits::STOP_BITS_1);
+      serial_port_.SetFlowControl(LibSerial::FlowControl::FLOW_CONTROL_NONE);
+      serial_port_.SetSerialPortBlockingStatus(true);
 
-    if (!serial_port_.IsOpen()) {
-      throw LibSerial::OpenFailed("Port open failed after configuration");
+      if (!serial_port_.IsOpen()) {
+        throw LibSerial::OpenFailed("Port open failed after configuration");
+      }
+    } catch (const std::exception & error) {
+      if (!open_failure_reported_) {
+        RCLCPP_ERROR(
+          this->get_logger(),
+          "Cannot open %s: %s. Retrying every %d ms.",
+          serial_port_name_.c_str(),
+          error.what(),
+          reconnect_interval_ms_);
+        open_failure_reported_ = true;
+      }
+      close_serial_port();
+      return false;
     }
+
+    // Stale bytes from a previous connection would only feed the resync scan.
+    rx_buffer_.clear();
+    open_failure_reported_ = false;
 
     RCLCPP_INFO(
       this->get_logger(),
       "IBUS receiver on %s (%d-8N1)",
       serial_port_name_.c_str(),
-      baud_rate);
+      baud_rate_);
+
+    return true;
   }
 
-  bool read_packet(std::vector<std::uint8_t> &packet)
+  void close_serial_port()
   {
-    packet.clear();
-    packet.reserve(kIbusPacketSize);
-
-    while (rclcpp::ok()) {
-      std::uint8_t byte = 0;
-      try {
-        serial_port_.ReadByte(byte, read_timeout_ms_);
-      } catch (const LibSerial::ReadTimeout &) {
-        return false;
+    try {
+      if (serial_port_.IsOpen()) {
+        serial_port_.Close();
       }
+    } catch (const std::exception &) {
+      // Nothing useful is left to do with a port that will not close.
+    }
+  }
 
-      if (byte != kIbusHeader) {
+  void read_loop()
+  {
+    while (running_ && rclcpp::ok()) {
+      if (!serial_port_.IsOpen()) {
+        if (!try_open_serial_port()) {
+          sleep_ms(reconnect_interval_ms_);
+        }
         continue;
       }
 
-      packet.push_back(byte);
-
-      for (std::size_t i = 1; i < kIbusPacketSize; ++i) {
-        try {
-          serial_port_.ReadByte(byte, read_timeout_ms_);
-        } catch (const LibSerial::ReadTimeout &) {
-          packet.clear();
-          return false;
+      try {
+        if (read_available_bytes()) {
+          parse_and_publish();
         }
-        packet.push_back(byte);
+      } catch (const std::exception & error) {
+        // Losing the device mid-run used to escape spin() and kill the process. Drop the
+        // handle instead and let the reconnect path pick the device back up.
+        RCLCPP_ERROR(
+          this->get_logger(),
+          "Serial read on %s failed: %s. Reopening the port.",
+          serial_port_name_.c_str(),
+          error.what());
+        close_serial_port();
+        sleep_ms(reconnect_interval_ms_);
+        continue;
       }
 
-      return true;
+      report_signal_state();
     }
-
-    return false;
   }
 
-  bool read_channels(std::vector<std::uint16_t> &channels)
+  // Returns false when the read timed out without producing any data.
+  bool read_available_bytes()
   {
-    std::vector<std::uint8_t> packet;
-    if (!read_packet(packet) || !verify_checksum(packet)) {
+    std::uint8_t first_byte = 0;
+    try {
+      // Waiting on a single byte is what keeps this thread idle while the receiver is
+      // quiet. read_timeout_ms bounds the wait so shutdown stays responsive.
+      serial_port_.ReadByte(first_byte, static_cast<std::size_t>(read_timeout_ms_));
+    } catch (const LibSerial::ReadTimeout &) {
       return false;
     }
 
-    channels.clear();
-    channels.reserve(kIbusChannelCount);
-    for (std::size_t i = 0; i < kIbusChannelCount; ++i) {
-      const auto base_index = 2 + (i * 2);
-      const auto channel_value = static_cast<std::uint16_t>(packet[base_index]) |
-        (static_cast<std::uint16_t>(packet[base_index + 1]) << 8);
-      channels.push_back(channel_value);
+    rx_buffer_.push_back(first_byte);
+
+    // Take everything the kernel already holds in one call. This is what drains a
+    // backlog instead of metering it out one frame per cycle.
+    std::size_t available = 0;
+    const auto bytes_available = serial_port_.GetNumberOfBytesAvailable();
+    if (bytes_available > 0) {
+      available = std::min(static_cast<std::size_t>(bytes_available), kMaxReadChunkBytes);
+    }
+
+    if (available > 0) {
+      LibSerial::DataBuffer chunk;
+      try {
+        serial_port_.Read(chunk, available, static_cast<std::size_t>(read_timeout_ms_));
+      } catch (const LibSerial::ReadTimeout &) {
+        // These bytes were reported as available, so a timeout here is not expected.
+        // Keep whatever landed in the buffer; the parser only acts on whole frames.
+      }
+      rx_buffer_.insert(rx_buffer_.end(), chunk.begin(), chunk.end());
     }
 
     return true;
   }
 
-  void publish_frame()
+  void parse_and_publish()
   {
-    std::vector<std::uint16_t> channels;
-    if (!read_channels(channels)) {
+    const auto scan = rf_joy::ibus::scan_frames(
+      rx_buffer_,
+      [this](const std::uint8_t * frame) {
+        rf_joy::ibus::decode_channels(frame, latest_channels_);
+        if (!publish_latest_only_) {
+          publish_channels();
+        }
+      });
+
+    rx_buffer_.erase(
+      rx_buffer_.begin(),
+      rx_buffer_.begin() + static_cast<std::ptrdiff_t>(scan.consumed));
+    dropped_bytes_ += scan.discarded_bytes;
+
+    if (scan.valid_frames == 0) {
       return;
     }
 
-    last_channels_ = channels;
+    frame_count_ += scan.valid_frames;
+    last_frame_time_ = std::chrono::steady_clock::now();
+
+    if (signal_lost_) {
+      RCLCPP_INFO(
+        this->get_logger(),
+        "IBUS frames received again on %s",
+        serial_port_name_.c_str());
+      signal_lost_ = false;
+    }
+
+    if (publish_latest_only_) {
+      publish_channels();
+    }
+
+    RCLCPP_DEBUG(
+      this->get_logger(),
+      "IBUS link: %zu frames, %zu bytes discarded during resync",
+      frame_count_,
+      dropped_bytes_);
+  }
+
+  void publish_channels()
+  {
+    if (max_publish_period_ > std::chrono::steady_clock::duration::zero()) {
+      const auto current_time = std::chrono::steady_clock::now();
+      if (current_time - last_publish_time_ < max_publish_period_) {
+        return;
+      }
+      last_publish_time_ = current_time;
+    }
 
     std_msgs::msg::UInt16MultiArray message;
-    message.data = last_channels_;
+    message.data = latest_channels_;
     publisher_->publish(message);
   }
 
+  void report_signal_state()
+  {
+    if (signal_lost_) {
+      return;
+    }
+
+    const auto elapsed = std::chrono::steady_clock::now() - last_frame_time_;
+    if (elapsed < std::chrono::milliseconds(signal_timeout_ms_)) {
+      return;
+    }
+
+    RCLCPP_WARN(
+      this->get_logger(),
+      "No valid IBUS frame on %s for %d ms. Check the receiver power, the i-BUS output "
+      "mode and the baud rate.",
+      serial_port_name_.c_str(),
+      signal_timeout_ms_);
+    signal_lost_ = true;
+  }
+
+  // Sleeps in short steps so a pending shutdown is not delayed by a full interval.
+  void sleep_ms(const int duration_ms)
+  {
+    const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(duration_ms);
+    while (running_ && rclcpp::ok() && std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(kShutdownPollIntervalMs));
+    }
+  }
+
   std::string serial_port_name_;
+  int baud_rate_{kDefaultBaudRate};
   int read_timeout_ms_{kDefaultReadTimeoutMs};
+  int signal_timeout_ms_{kDefaultSignalTimeoutMs};
+  int reconnect_interval_ms_{kDefaultReconnectIntervalMs};
+  bool publish_latest_only_{true};
+  std::chrono::steady_clock::duration max_publish_period_{
+    std::chrono::steady_clock::duration::zero()};
+
   LibSerial::SerialPort serial_port_;
-  std::vector<std::uint16_t> last_channels_ =
-    std::vector<std::uint16_t>(kIbusChannelCount, 1500);
   rclcpp::Publisher<std_msgs::msg::UInt16MultiArray>::SharedPtr publisher_;
-  rclcpp::TimerBase::SharedPtr timer_;
+
+  // Touched only by the reader thread once it has been started.
+  std::vector<std::uint8_t> rx_buffer_;
+  std::vector<std::uint16_t> latest_channels_;
+  std::chrono::steady_clock::time_point last_frame_time_;
+  std::chrono::steady_clock::time_point last_publish_time_;
+  std::size_t frame_count_{0};
+  std::size_t dropped_bytes_{0};
+  bool signal_lost_{false};
+  bool open_failure_reported_{false};
+
+  std::atomic<bool> running_{false};
+  std::thread reader_thread_;
 };
 
-int main(int argc, char *argv[])
+int main(int argc, char * argv[])
 {
   rclcpp::init(argc, argv);
 
   try {
     rclcpp::spin(std::make_shared<RfPublisherNode>());
-  } catch (const LibSerial::OpenFailed &error) {
-    RCLCPP_ERROR(rclcpp::get_logger("rf_publisher_node"), "Serial open failed: %s", error.what());
-    rclcpp::shutdown();
-    return 1;
-  } catch (const std::exception &error) {
+  } catch (const std::exception & error) {
     RCLCPP_ERROR(rclcpp::get_logger("rf_publisher_node"), "Unhandled exception: %s", error.what());
     rclcpp::shutdown();
     return 1;
