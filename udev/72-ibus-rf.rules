@@ -1,0 +1,67 @@
+# Stable device name for the FlySky i-BUS receiver.
+#
+# A USB-UART adapter is enumerated in plug order, so it lands on /dev/ttyUSB0 one boot and
+# /dev/ttyUSB1 the next. This rule gives it the fixed name /dev/rf, which is what
+# config/rf_publisher.yaml expects, so the same configuration works on every machine.
+#
+# Install:
+#   sudo cp udev/72-ibus-rf.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules
+#   sudo udevadm trigger --subsystem-match=tty --subsystem-match=usb-serial
+#   ls -l /dev/rf
+#
+# MODE/GROUP make the port readable without root for members of the dialout group
+# (sudo usermod -aG dialout $USER, then log out and back in). TAG+="uaccess" additionally
+# grants the user of the active local session immediate access, which is what makes the
+# port usable before that first re-login.
+#
+# ENV{ID_MM_DEVICE_IGNORE} keeps ModemManager from probing the port at plug time. Without
+# it, its AT command probe eats the first seconds of i-BUS traffic on desktop installs.
+
+# The file name has to sort before 73-seat-late.rules, which is what turns TAG+="uaccess"
+# into an actual ACL entry. Named 99-*, the tag is attached after that rule has already run
+# and the ACL is silently never applied - the symlink appears but the port stays unreadable.
+
+# FTDI FT231X  (lsusb: 0403:6015) - the adapter this package was tested with
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6015", \
+  SYMLINK+="rf", MODE="0660", GROUP="dialout", TAG+="uaccess", ENV{ID_MM_DEVICE_IGNORE}="1"
+
+# FTDI adapters hand data to the host one full 512 byte USB transfer at a time, which at
+# the i-BUS byte rate is one delivery every ~110 ms and caps /rf at about 9 Hz.
+#
+# rf_publisher_node fixes this itself: it asks the driver for ASYNC_LOW_LATENCY when it
+# opens the port, which makes ftdi_sio program latency_timer to 1. That needs no privileges
+# and no rule, so nothing here is required for the node to run at full rate. Set
+# low_latency: false in config/rf_publisher.yaml to opt out.
+#
+# Uncomment the rule below only if other tools have to see a low latency_timer as well,
+# `cat /dev/rf` or a terminal program that does not set the flag itself. It is harmless
+# alongside the node.
+#
+#ACTION=="add|change", SUBSYSTEM=="usb-serial", DRIVER=="ftdi_sio", \
+#  ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6015", ATTR{latency_timer}="1"
+
+# Other common USB-UART bridges. Uncomment the line that matches your adapter.
+#
+# FTDI FT232R  (0403:6001)
+#SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6001", \
+#  SYMLINK+="rf", MODE="0660", GROUP="dialout", TAG+="uaccess", ENV{ID_MM_DEVICE_IGNORE}="1"
+#
+# Silicon Labs CP210x  (10c4:ea60)
+#SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", \
+#  SYMLINK+="rf", MODE="0660", GROUP="dialout", TAG+="uaccess", ENV{ID_MM_DEVICE_IGNORE}="1"
+#
+# WCH CH340/CH341  (1a86:7523)
+#SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", \
+#  SYMLINK+="rf", MODE="0660", GROUP="dialout", TAG+="uaccess", ENV{ID_MM_DEVICE_IGNORE}="1"
+
+# With more than one adapter of the same model on the machine, matching by vendor and
+# product alone is ambiguous and whichever device is probed last wins the symlink. Pin the
+# rule to one physical adapter by adding its serial number, which
+# `udevadm info -a -n /dev/ttyUSB0 | grep '{serial}'` prints:
+#
+#SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6015", ATTRS{serial}=="DP056YSY", \
+#  SYMLINK+="rf", MODE="0660", GROUP="dialout", TAG+="uaccess", ENV{ID_MM_DEVICE_IGNORE}="1"
+
+# A Jetson using the built-in UART (/dev/ttyTHS1) needs no rule at all: that device name is
+# already stable. Set serial_port back to "/dev/ttyTHS1" in config/rf_publisher.yaml.

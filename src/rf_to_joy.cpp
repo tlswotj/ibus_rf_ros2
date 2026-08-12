@@ -34,6 +34,13 @@ constexpr int kDefaultWatchdogTimeoutMs = 200;
 constexpr double kDefaultWatchdogRateHz = 50.0;
 constexpr int kDefaultQosDepth = 10;
 
+// rf_publisher_node decodes 14 channels and i-BUS itself tops out at 18, so an index past
+// this is a configuration mistake rather than an exotic setup. Rejecting it up front also
+// keeps channels_available() from having to compare values that do not survive a narrowing
+// cast: a channel of 2^32 silently becomes 0 as an int, passes the size check and then
+// indexes the message out of bounds.
+constexpr std::int64_t kChannelIndexLimit = 32;
+
 bool evaluate_threshold(
   const std::uint16_t value,
   const int threshold,
@@ -190,9 +197,10 @@ private:
               "the same length");
     }
 
-    auto validate_channel = [](const int channel, const std::string & name) {
-        if (channel < 0) {
-          throw std::invalid_argument(name + " must be zero or greater");
+    auto validate_channel = [](const std::int64_t channel, const std::string & name) {
+        if (channel < 0 || channel >= kChannelIndexLimit) {
+          throw std::invalid_argument(
+                  name + " must be within [0, " + std::to_string(kChannelIndexLimit - 1) + "]");
         }
       };
 
@@ -202,14 +210,14 @@ private:
     }
 
     for (std::size_t i = 0; i < axis_count; ++i) {
-      validate_channel(static_cast<int>(axis_channels_[i]), "axes.channels");
+      validate_channel(axis_channels_[i], "axes.channels");
       if (std::abs(axis_scales_[i]) < std::numeric_limits<double>::epsilon()) {
         throw std::invalid_argument("axes.scales must not contain zero");
       }
     }
 
     for (const auto channel : button_channels_) {
-      validate_channel(static_cast<int>(channel), "buttons.channels");
+      validate_channel(channel, "buttons.channels");
     }
 
     if (watchdog_enabled_) {
@@ -323,16 +331,18 @@ private:
 
   bool channels_available(const std::vector<std::uint16_t> & channels) const
   {
-    int max_channel = kill_switch_channel_;
+    // Every index has been checked against kChannelIndexLimit already, so the widest one
+    // is a small non negative number and the cast below is safe.
+    std::int64_t max_channel = kill_switch_channel_;
     if (publish_gate_enabled_) {
-      max_channel = std::max(max_channel, publish_gate_channel_);
+      max_channel = std::max(max_channel, static_cast<std::int64_t>(publish_gate_channel_));
     }
 
     for (const auto channel : axis_channels_) {
-      max_channel = std::max(max_channel, static_cast<int>(channel));
+      max_channel = std::max(max_channel, channel);
     }
     for (const auto channel : button_channels_) {
-      max_channel = std::max(max_channel, static_cast<int>(channel));
+      max_channel = std::max(max_channel, channel);
     }
 
     return channels.size() > static_cast<std::size_t>(max_channel);

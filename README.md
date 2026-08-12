@@ -10,7 +10,14 @@ FlySky `FS-i6X` 송신기와 `FS-A8S` 수신기의 `i-BUS` 출력을 리눅스 �
 2. `rf_to_joy_node`
    `/rf`를 받아 `sensor_msgs/msg/Joy` 형식의 `/joy`로 변환한다.
 
-기본 테스트 환경은 `Jetson Orin NX` + `FS-i6X` + `FS-A8S` + `UART(/dev/ttyTHS1)` 조합이다.
+기본 테스트 환경은 `Jetson Orin NX` + `FS-i6X` + `FS-A8S` + `UART(/dev/ttyTHS1)` 조합이고,
+`x86_64` 데스크톱 + `FTDI USB-UART` 어댑터 조합에서도 동작을 확인했다.
+`ROS 2 Humble`과 `Jazzy` 양쪽에서 빌드된다.
+
+USB-UART 어댑터는 꽂는 순서에 따라 `/dev/ttyUSB0`이 되기도 `/dev/ttyUSB1`이 되기도 한다.
+그래서 이 패키지는 `udev` 규칙으로 어댑터에 **`/dev/rf`라는 고정 이름**을 붙이고,
+설정 파일은 그 이름만 바라보게 해 두었다. 설정을 컴퓨터마다 고칠 필요가 없다.
+자세한 내용은 [4.4 시리얼 장치 이름 고정과 권한](#44-시리얼-장치-이름-고정과-권한-udev)을 참고한다.
 
 ## 1. 사용 장비와 통신 개요
 
@@ -116,6 +123,7 @@ FS-A8S i-BUS/S.BUS  ->  UART/USB-TTL RX
 ## 4. 설치 방법
 
 아래 설명은 Ubuntu 22.04 + ROS 2 Humble 기준이다.
+Ubuntu 24.04 + ROS 2 Jazzy에서도 배포판 이름만 바꾸면 그대로 적용된다.
 
 ### 4.1 필수 패키지 설치
 
@@ -128,6 +136,11 @@ sudo apt install -y \
 ```
 
 이미 ROS 2 Humble이 설치되어 있다면 `libserial-dev`와 `python3-colcon-common-extensions`만 추가로 설치하면 된다.
+Jazzy를 쓴다면 `ros-humble-desktop` 대신 `ros-jazzy-desktop`을 설치한다.
+
+`libserial`은 `pkg-config`(`libserial.pc`)로 찾는다.
+경로를 직접 적어 두면 `x86_64-linux-gnu`와 `aarch64-linux-gnu`처럼 아키텍처마다 다른
+멀티아치 디렉터리를 놓치기 때문에, 데스크톱과 Jetson에서 같은 `CMakeLists.txt`가 그대로 통한다.
 
 ### 4.2 워크스페이스 배치
 
@@ -140,8 +153,11 @@ sudo apt install -y \
       CMakeLists.txt
       package.xml
       src/
+      include/
       launch/
       config/
+      udev/
+      test/
 ```
 
 주의:
@@ -166,29 +182,100 @@ colcon build --packages-select rf_joy
 source install/setup.bash
 ```
 
-lint 검사는 아래로 실행한다.
+lint 검사와 `i-BUS` 파서 단위 테스트는 아래로 실행한다.
 
 ```bash
 colcon test --packages-select rf_joy
 colcon test-result --verbose
 ```
 
-### 4.4 시리얼 권한
+> `ModuleNotFoundError: No module named 'catkin_pkg'`로 빌드가 실패한다면,
+> `pyenv`나 `uv`가 `~/.local/bin`에 깔아 둔 파이썬을 CMake가 시스템 파이썬보다 먼저
+> 집어간 경우다. `which python3`가 정상으로 보여도 CMake는 `python3.10` 같은
+> 버전별 이름을 따로 찾기 때문에 발생한다. 아래처럼 인터프리터를 못 박으면 된다.
+>
+> ```bash
+> colcon build --packages-select rf_joy --cmake-args -DPython3_EXECUTABLE=/usr/bin/python3
+> ```
 
-USB-TTL 어댑터가 `/dev/ttyUSB0` 등으로 잡혔는데 권한 에러가 나면 아래를 확인한다.
+### 4.4 시리얼 장치 이름 고정과 권한 (udev)
+
+USB-UART 어댑터의 `/dev/ttyUSB*` 번호는 꽂는 순서와 부팅 순서에 따라 달라진다.
+설정 파일에 `/dev/ttyUSB0`을 그대로 적어 두면 어댑터를 다시 꽂거나 다른 컴퓨터로 옮겼을 때
+엉뚱한 장치를 열게 되므로, 이 저장소는 [`udev/72-ibus-rf.rules`](./udev/72-ibus-rf.rules)로
+어댑터에 `/dev/rf`라는 고정 이름을 붙인다.
+
+먼저 어댑터의 `USB` 벤더/제품 ID를 확인한다.
 
 ```bash
-ls -l /dev/ttyUSB0
-groups
+lsusb
+ls -l /dev/serial/by-id/
 ```
 
-필요하면 사용자에게 `dialout` 그룹을 부여한다.
+`udev/72-ibus-rf.rules`는 기본적으로 `FTDI FT231X`(`0403:6015`)를 매칭한다.
+`CP210x`, `CH340`, `FT232R`용 줄은 파일 안에 주석으로 준비돼 있으니
+자기 어댑터에 해당하는 줄의 주석을 해제하면 된다.
+
+규칙을 설치하고 적용한다. 아래 스크립트가 복사 / 재적용 / 확인까지 한 번에 처리한다.
+
+```bash
+sudo ./udev/install_udev_rules.sh
+```
+
+빌드된 워크스페이스에서 실행할 수도 있다.
+
+```bash
+sudo $(ros2 pkg prefix rf_joy)/share/rf_joy/udev/install_udev_rules.sh
+```
+
+직접 하고 싶다면 아래와 같다.
+
+```bash
+sudo cp udev/72-ibus-rf.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules
+sudo udevadm trigger --subsystem-match=tty --subsystem-match=usb-serial
+```
+
+확인한다.
+
+```bash
+ls -l /dev/rf
+# /dev/rf -> ttyUSB0
+```
+
+권한은 규칙이 함께 처리한다.
+
+- `GROUP="dialout", MODE="0660"` — `dialout` 그룹 사용자에게 읽기/쓰기를 준다.
+- `TAG+="uaccess"` — 현재 로컬 세션 사용자에게 `ACL`로 즉시 접근 권한을 준다.
+  `dialout` 그룹에 막 추가해서 아직 재로그인을 안 한 상태에서도 바로 쓸 수 있게 해 준다.
+  파일 이름이 `99-`가 아니라 `72-`인 이유가 이것이다. 태그를 실제 `ACL`로 바꿔 주는
+  `/usr/lib/udev/rules.d/73-seat-late.rules`보다 **먼저** 실행되어야 하며,
+  `99-`로 두면 심볼릭 링크는 생기는데 `ACL`만 조용히 안 붙는다.
+- `ENV{ID_MM_DEVICE_IGNORE}="1"` — `ModemManager`가 포트를 모뎀으로 오인해 `AT` 명령으로
+  탐침하는 것을 막는다. 이게 없으면 꽂은 직후 몇 초 동안 `i-BUS` 데이터를 빼앗긴다.
+
+`FTDI` 어댑터의 `latency_timer`는 `udev`가 아니라 `rf_publisher_node`가 직접 낮춘다.
+포트를 열 때 `ASYNC_LOW_LATENCY`를 요청하는데, 이 플래그는 권한이 필요 없어서
+규칙이나 `root` 없이도 동작한다. 자세한 내용은
+[8. 트러블슈팅](#rf-주기가-10hz-근처로-낮게-나오는-경우-usb-어댑터)에 정리해 두었다.
+
+서비스로 띄우는 등 로컬 세션이 없는 환경이라면 `dialout` 그룹 등록이 필요하다.
 
 ```bash
 sudo usermod -a -G dialout $USER
 ```
 
-그 뒤 로그아웃/로그인 또는 재부팅 후 다시 확인한다.
+그 뒤 로그아웃/로그인 또는 재부팅 후 `groups`로 확인한다.
+
+같은 모델의 어댑터를 두 개 이상 꽂는다면 벤더/제품 ID만으로는 구분이 안 된다.
+이때는 규칙에 시리얼 번호를 추가해 물리적으로 한 어댑터에 못 박는다.
+
+```bash
+udevadm info -a -n /dev/ttyUSB0 | grep '{serial}'
+```
+
+Jetson 내장 `UART`(`/dev/ttyTHS1`)를 쓰는 경우에는 이름이 이미 고정이므로 규칙이 필요 없다.
+`config/rf_publisher.yaml`의 `serial_port`만 `/dev/ttyTHS1`로 되돌리면 된다.
 
 ## 5. 설정 파일
 
@@ -204,7 +291,7 @@ sudo usermod -a -G dialout $USER
 ```yaml
 rf_publisher_node:
   ros__parameters:
-    serial_port: "/dev/ttyTHS1"
+    serial_port: "/dev/rf"
     baud_rate: 115200
     read_timeout_ms: 50
     publish_latest_only: true
@@ -220,13 +307,19 @@ rf_publisher_node:
 
 - `serial_port`
   사용할 리눅스 시리얼 디바이스
-  예: `/dev/ttyTHS1`, `/dev/ttyUSB0`, `/dev/ttyACM0`
+  기본값은 `udev` 규칙이 만들어 주는 고정 이름 `/dev/rf`다 ([4.4](#44-시리얼-장치-이름-고정과-권한-udev) 참고)
+  Jetson 내장 UART를 쓰면 `/dev/ttyTHS1`, 규칙 없이 직접 지정하려면 `/dev/ttyUSB0` 등을 적는다
 - `baud_rate`
   `i-BUS` 수신 baud rate
   기본값은 `115200`
 - `read_timeout_ms`
   데이터가 올 때까지 `poll()`로 대기하는 최대 시간(ms)
   수신이 없을 때 읽기 스레드가 커널에서 잠겨 있는 단위이고, 노드 종료 응답 시간의 상한도 된다
+- `low_latency`
+  포트를 열 때 드라이버에 저지연 모드(`ASYNC_LOW_LATENCY`)를 요청한다
+  기본값 `true`이며, USB-UART 어댑터에서 `/rf`가 `9Hz` 근처로 주저앉는 것을 막는다
+  ([아래 트러블슈팅](#rf-주기가-10hz-근처로-낮게-나오는-경우-usb-어댑터) 참고)
+  `pty`처럼 지원하지 않는 장치에서는 조용히 무시된다
 - `publish_latest_only`
   `true`면 한 번에 읽어들인 데이터에서 가장 최신 프레임만 발행한다 (제어 입력에는 이 값을 권장)
   `false`면 읽어들인 유효 프레임을 모두 발행한다
@@ -512,11 +605,85 @@ ros2 topic hz /joy
 - 반전이 필요하면 `axes.invert`
 - 감도가 크거나 작으면 `axes.scales`
 
+### `/rf` 주기가 `10Hz` 근처로 낮게 나오는 경우 (USB 어댑터)
+
+`max_publish_rate_hz`가 `30.0`인데 `ros2 topic hz /rf`가 `9Hz` 부근으로 나오는 증상이다.
+기본 설정(`low_latency: true`)에서는 노드가 알아서 처리하므로 나타나지 않아야 한다.
+
+원인은 아래와 같다.
+
+`FTDI` 칩은 `latency_timer` 주기마다 `64바이트` `USB` 패킷을 내보낸다.
+그런데 `full-speed USB`에서 `64바이트`는 "꽉 찬" 패킷이라 드라이버의 `512바이트` 전송을
+조기 종료시키지 못하고, 패킷 8개가 모여야 비로소 호스트로 넘어온다.
+`i-BUS` 바이트 속도에서 이는 약 `110ms`에 한 번, `496바이트` 덩어리로 도착한다는 뜻이다.
+노드는 도착한 데이터를 항상 다 비우지만 발행 기회 자체가 `110ms`마다 한 번뿐이므로
+`/rf`는 약 `9Hz`가 되고, 모든 채널 값에 그만큼의 지연이 그대로 얹힌다.
+
+`latency_timer`를 `1`로 낮추면 `1ms` 동안 쌓인 몇 바이트에 상태 바이트 2개만 붙은
+**짧은** 패킷이 되고, 짧은 패킷은 전송을 즉시 끝내므로 바이트가 `1ms` 간격으로 올라온다.
+
+`rf_publisher_node`는 포트를 열 때 `TIOCSSERIAL`로 `ASYNC_LOW_LATENCY` 플래그를 세우는데,
+`ftdi_sio` 드라이버가 이 플래그를 보면 `latency_timer`를 `1`로 프로그래밍한다.
+이 플래그는 `ASYNC_USR_MASK`에 속해서 **`root` 권한도 `udev` 규칙도 필요 없다.**
+일반 `8250 UART`에서도 드라이버가 라인 디시플린으로 넘기는 것을 미루지 않게 하는 효과가 있다.
+
+로그에 아래가 찍히면 적용된 것이다.
+
+```text
+[INFO] [rf_publisher_node]: Low latency mode enabled on /dev/rf
+```
+
+이 줄은 노드가 실제로 설정을 바꿨을 때만 나온다.
+플래그는 어댑터를 다시 꽂을 때까지 드라이버에 남아 있으므로,
+노드를 껐다 다시 켜면 이미 켜져 있는 상태라 이 줄이 나오지 않는 것이 정상이다.
+
+확인은 노드를 띄운 채로 아래를 읽으면 된다.
+
+```bash
+cat /sys/bus/usb-serial/devices/ttyUSB0/latency_timer
+# 1
+```
+
+실측 (`FT231X`, 이 저장소 기준):
+
+| `latency_timer` | 도착 패턴 | `/rf` 발행률 |
+| --- | --- | --- |
+| `16` (기본값) | `496`바이트 / 약 `107ms` | `9.2Hz` |
+| `1` (규칙 적용) | `2 ~ 11`바이트 / 약 `1ms` | `28.6Hz` |
+
+`low_latency: false`로 끄면 이 요청을 하지 않는다.
+그 상태로 낮은 `latency_timer`가 필요하거나, `cat /dev/rf` 같은 다른 도구에도 적용하고 싶다면
+`udev/72-ibus-rf.rules`에 주석으로 준비된 `latency_timer` 규칙을 해제하거나
+아래처럼 직접 쓸 수 있다(재부팅하면 사라진다).
+
+```bash
+echo 1 | sudo tee /sys/bus/usb-serial/devices/ttyUSB0/latency_timer
+```
+
+Jetson 내장 `UART`(`/dev/ttyTHS1`)는 `USB`를 거치지 않으므로 해당 없다.
+
+### `/dev/rf`가 생기지 않는 경우
+
+```bash
+ls -l /dev/serial/by-id/          # 어댑터 자체가 잡혔는지
+lsusb                             # 벤더/제품 ID 확인
+udevadm test /sys/class/tty/ttyUSB0 2>&1 | grep -i rf   # 규칙이 매칭되는지
+```
+
+- 규칙 파일이 `/etc/udev/rules.d/72-ibus-rf.rules`에 복사됐는지 확인한다.
+- 규칙의 `idVendor` / `idProduct`가 `lsusb` 출력과 같은지 확인한다.
+  다른 칩(`CP210x`, `CH340` 등)이면 파일 안의 해당 줄 주석을 해제해야 한다.
+- 규칙을 고친 뒤에는 `sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=tty --subsystem-match=usb-serial`를
+  다시 실행하거나 어댑터를 뽑았다 꽂는다.
+- 그래도 안 되면 `serial_port`에 `/dev/ttyUSB0`을 직접 적어 동작부터 확인한다.
+
 ### 시리얼 권한 에러가 나는 경우
 
-- `dialout` 그룹 설정을 확인한다.
+- `ls -l /dev/rf`로 소유 그룹과 모드를 확인한다. 규칙대로면 `dialout` 그룹에 `0660`이다.
+- `groups`에 `dialout`이 없으면 `sudo usermod -a -G dialout $USER` 후 재로그인한다.
+- `udev` 규칙의 `TAG+="uaccess"` 덕분에 로컬 세션 사용자는 재로그인 전에도 접근할 수 있다.
+  `getfacl /dev/rf`로 `ACL`이 붙었는지 확인할 수 있다.
 - Jetson 내장 UART를 쓰는 경우 장치 이름이 `/dev/ttyTHS1` 같은지 다시 확인한다.
-- USB-TTL을 쓰는 경우 연결할 때마다 `/dev/ttyUSB0`, `/dev/ttyUSB1`처럼 달라질 수 있다.
 
 ## 9. 참고 자료
 
